@@ -1,3 +1,4 @@
+export const runtime = 'nodejs';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 
