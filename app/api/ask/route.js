@@ -3,7 +3,7 @@ export const runtime = 'nodejs';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 
-/** Helpers */
+/** Supabase & OpenAI helpers */
 function sb() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -16,7 +16,7 @@ function oa() {
   return new OpenAI({ apiKey: key });
 }
 
-/** Quick heuristic router for obvious questions */
+/** Quick heuristic router for obvious questions (fast, no LLM) */
 function quickSearchParse(message) {
   const m = message.trim().toLowerCase();
 
@@ -67,7 +67,12 @@ function quickSearchParse(message) {
   }
 
   // crude keywords: words >2 chars, strip stop-words
-  const stop = new Set(['show','list','find','search','entries','entry','this','last','week','month','today','yesterday','the','a','an','of','at','in','with','for','to','and','or','me','my','did','i','what','when','where','who','how','many']);
+  const stop = new Set([
+    'show','list','find','search','entries','entry',
+    'this','last','week','month','today','yesterday',
+    'the','a','an','of','at','in','with','for','to','and','or',
+    'me','my','did','i','what','when','where','who','how','many'
+  ]);
   const keywords = m.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stop.has(w));
 
   return {
@@ -83,7 +88,7 @@ function quickSearchParse(message) {
   };
 }
 
-/** LLM router prompt (used when not obviously a query) */
+/** LLM router (used only when not obviously a query) */
 const SYSTEM = `You are Psyclone's router.
 Decide INTENT for the user's message:
 - "SAVE" if it's a durable note/event/fact/task we should store.
@@ -117,7 +122,8 @@ Output STRICT JSON:
 { "intent": "SAVE|SEARCH|NONE", "save": {...} or null, "search": {...} or null }
 
 Rules:
-- If the message begins with or contains words like "show", "list", "find", "search", "entries", or is clearly a question ("when did I", "what did I", "where did I", "?"), classify as SEARCH.
+- If the message begins with or contains words like "show", "list", "find", "search", "entries",
+  or is clearly a question ("when did I", "what did I", "where did I", "?"), classify as SEARCH.
 - Only SAVE if confidence >= 0.75.
 - Europe/London when resolving relative dates ("yesterday 6pm").
 - Do not invent people or amounts.`;
@@ -129,14 +135,14 @@ export async function POST(req) {
       return Response.json({ ok: false, reason: 'No message' }, { status: 400 });
     }
 
-    // 1) Heuristic: obvious questions => SEARCH
+    // 1) Heuristic first
     const quick = quickSearchParse(message);
     let intent, payload;
     if (quick) {
       intent = quick.intent;
       payload = quick;
     } else {
-      // 2) Fall back to LLM router
+      // 2) LLM router if not clearly a query
       const openai = oa();
       const chat = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -185,7 +191,7 @@ export async function POST(req) {
       return Response.json({ type: 'saved', id: data.id, summary: data.content });
     }
 
-    // SEARCH flow
+    // SEARCH flow (now uses v_documents_search.event_time)
     if (intent === 'SEARCH' && (payload.search || payload.intent === 'SEARCH')) {
       const supabase = sb();
       const {
@@ -197,29 +203,43 @@ export async function POST(req) {
         limit = 10,
       } = (payload.search || {});
 
-      let query = supabase
-        .from('documents')
-        .select('id, kind, content, place, happened_at, category, person_names')
-        .eq('is_ignored', false)
-        .order('recorded_at', { ascending: false })
-        .limit(Math.min(Math.max(limit || 10, 1), 20));
+      const buildQuery = (useDates) => {
+        let q = supabase
+          .from('v_documents_search')
+          .select('id, kind, content, place, event_time, recorded_at, category, person_names')
+          .eq('is_ignored', false)
+          .order('event_time', { ascending: false })
+          .limit(Math.min(Math.max(limit || 10, 1), 20));
 
-      if (kind) query = query.eq('kind', kind);
-      if (date_from) query = query.gte('happened_at', date_from);
-      if (date_to) query = query.lte('happened_at', date_to);
-      if (person_names?.length) query = query.contains('person_names', person_names);
-
-      if (keywords?.length) {
-        const ors = [];
-        for (const k of keywords) {
-          const like = `%${k}%`;
-          ors.push(`content.ilike.${like}`, `body.ilike.${like}`, `place.ilike.${like}`);
+        if (kind) q = q.eq('kind', kind);
+        if (useDates) {
+          if (date_from) q = q.gte('event_time', date_from);
+          if (date_to) q = q.lte('event_time', date_to);
         }
-        query = query.or(ors.join(','));
+        if (person_names?.length) q = q.contains('person_names', person_names);
+
+        if (keywords?.length) {
+          const ors = [];
+          for (const k of keywords) {
+            const like = `%${k}%`;
+            ors.push(`content.ilike.${like}`, `body.ilike.${like}`, `place.ilike.${like}`);
+          }
+          q = q.or(ors.join(','));
+        }
+        return q;
+      };
+
+      // Try with date window first (if any)…
+      let { data, error } = await buildQuery(Boolean(date_from || date_to));
+      if (error) throw error;
+
+      // …if none found and a date window was requested, retry without dates
+      if (data.length === 0 && (date_from || date_to)) {
+        const { data: data2, error: err2 } = await buildQuery(false);
+        if (err2) throw err2;
+        data = data2;
       }
 
-      const { data, error } = await query;
-      if (error) throw error;
       return Response.json({ type: 'results', count: data.length, items: data });
     }
 
