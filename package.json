@@ -1,8 +1,6 @@
 {
-  "name": "psyclone-mlp",
-  "version": "1.0.0",
+  "name": "psyclone-chat-shell",
   "private": true,
-  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -12,7 +10,7 @@
     "next": "14.2.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "@supabase/supabase-js": "^2.45.0",
-    "openai": "^4.58.0"
+    "openai": "4.58.1",
+    "@supabase/supabase-js": "^2.47.10"
   }
 }
