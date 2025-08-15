@@ -10,7 +10,6 @@ async function sb(path, method = 'GET', body) {
       apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
       'Content-Type': 'application/json',
-      // ensure inserts return rows
       Prefer: method === 'POST' ? 'return=representation' : undefined,
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -28,16 +27,13 @@ export async function POST(req) {
     }
     if (!process.env.ASSISTANT_ID) throw new Error('Missing ASSISTANT_ID');
 
-    // 1) create a new thread for this turn
     const thread = await openai.beta.threads.create();
     await openai.beta.threads.messages.create(thread.id, { role: 'user', content: message });
     let run = await openai.beta.threads.runs.create(thread.id, { assistant_id: process.env.ASSISTANT_ID });
 
-    // 2) loop: execute tool calls until completed
     const start = Date.now();
     while (true) {
       if (Date.now() - start > 45_000) throw new Error('Assistant timed out');
-
       run = await openai.beta.threads.runs.retrieve(thread.id, run.id);
 
       if (run.status === 'requires_action') {
@@ -89,7 +85,6 @@ export async function POST(req) {
             outputs.push({ tool_call_id: call.id, output: JSON.stringify({ ok: true, id }) });
 
           } else if (name === 'search_documents') {
-            // simple keyword/date search over documents
             const limit = Math.min(Math.max(args.limit || 10, 1), 25);
             const parts = [
               'select=id,kind,content,happened_at,place',
@@ -97,8 +92,6 @@ export async function POST(req) {
               'order=recorded_at.desc',
               'is_ignored=is.false',
             ];
-
-            // keywords -> OR over content/place
             const kws = Array.isArray(args.keywords) ? args.keywords.filter(Boolean) : [];
             if (kws.length) {
               const or = kws.slice(0, 4).flatMap(k => [
@@ -107,7 +100,6 @@ export async function POST(req) {
               ]).join(',');
               parts.push(`or=(${or})`);
             }
-
             if (args.date_from) parts.push(`happened_at=gte.${encodeURIComponent(args.date_from)}`);
             if (args.date_to)   parts.push(`happened_at=lte.${encodeURIComponent(args.date_to)}`);
 
@@ -123,7 +115,6 @@ export async function POST(req) {
         await openai.beta.threads.runs.submitToolOutputs(thread.id, run.id, { tool_outputs: outputs });
 
       } else if (run.status === 'completed') {
-        // 3) return the final assistant reply
         const msgs = await openai.beta.threads.messages.list(thread.id, { order: 'desc', limit: 5 });
         const reply =
           msgs.data.find((m) => m.role === 'assistant')?.content?.[0]?.text?.value?.trim() ||
