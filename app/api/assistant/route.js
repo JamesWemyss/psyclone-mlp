@@ -1,306 +1,328 @@
 // app/api/assistant/route.js
-export const runtime = 'nodejs';
+import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 
-import OpenAI from 'openai';
-import { createClient } from '@supabase/supabase-js';
+// ---- env ----
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
 
-/* ──────────────────────────
-   Clients
-   ────────────────────────── */
-function sb() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error('Missing Supabase envs');
-  return createClient(url, key);
-}
-function oa() {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error('Missing OPENAI_API_KEY');
-  return new OpenAI({ apiKey: key });
-}
-function getAssistantId() {
-  const id = process.env.OPENAI_ASSISTANT_ID;
-  if (!id) throw new Error('Missing OPENAI_ASSISTANT_ID');
-  return id;
-}
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+if (!OPENAI_ASSISTANT_ID) throw new Error("Missing OPENAI_ASSISTANT_ID");
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Missing Supabase env vars");
 
-/* ──────────────────────────
-   DB actions (docs/goals/tasks)
-   ────────────────────────── */
-async function saveDocument(args) {
-  const payload = {
-    kind: args.kind || 'note',
-    content: args.content || '',
-    body: args.body || null,
-    happened_at: args.happened_at || null,
-    place: args.place || null,
-    person_names: Array.isArray(args.person_names) ? args.person_names : [],
-    amount: args.amount ?? null,
-    category: args.category || 'other',
-    source: 'assistant',
-  };
-  const { data, error } = await sb().from('documents').insert(payload).select().single();
-  if (error) throw error;
-  return { ok: true, id: data.id, summary: data.content };
-}
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-async function createGoal(args) {
-  const payload = {
-    title: args.title,
-    category: args.category || 'overall', // overall | work | personal
-    why: args.why || null,
-    target_date: args.target_date || null,
-  };
-  const { data, error } = await sb().from('goals').insert(payload).select().single();
-  if (error) throw error;
-  return { ok: true, id: data.id, title: data.title };
-}
+// Helpers
+const ok = (data = {}) => Response.json({ ok: true, ...data });
+const bad = (msg) => new Response(JSON.stringify({ ok: false, error: msg }), { status: 400 });
 
-async function createTask(args) {
-  const payload = {
-    title: args.title,
-    category: args.category, // work | personal (required)
-    goal_id: args.goal_id || null,
-    next_action: args.next_action || null,
-    due: args.due || null,
-    impact: args.impact ?? null,
-    energy_fit: args.energy_fit ?? null,
-    effort_hours: args.effort_hours ?? null,
-  };
-  const { data, error } = await sb().from('tasks').insert(payload).select().single();
-  if (error) throw error;
-  return { ok: true, id: data.id, title: data.title };
-}
-
-async function searchDocuments(args) {
+/**
+ * Handle tool call: save_document
+ */
+async function handleSaveDocument(args) {
   const {
-    keywords = [],
-    person_names = [],
-    kind = '',
-    date_from = '',
-    date_to = '',
-    limit = 10,
+    kind,
+    content,
+    body = null,
+    happened_at = null,
+    place = null,
+    person_names = null,
+    category = null,
+    amount = null,
+    is_ignored = false,
   } = args || {};
 
-  const supabase = sb();
-  let q = supabase
-    .from('v_documents_search')
-    .select('id, kind, content, place, event_time, recorded_at, category, person_names')
-    .eq('is_ignored', false)
-    .order('event_time', { ascending: false })
-    .limit(Math.min(Math.max(limit || 10, 1), 50));
+  if (!kind || !content) throw new Error("save_document requires kind and content");
 
-  if (kind) q = q.eq('kind', kind);
-  if (date_from) q = q.gte('event_time', date_from);
-  if (date_to) q = q.lte('event_time', date_to);
-  if (person_names?.length) q = q.contains('person_names', person_names);
+  const { data, error } = await supabase
+    .from("documents")
+    .insert([
+      {
+        kind,
+        content,
+        body,
+        happened_at,
+        place,
+        person_names: person_names || null,
+        category,
+        amount,
+        is_ignored,
+        recorded_at: new Date().toISOString(),
+      },
+    ])
+    .select("id")
+    .single();
 
-  if (keywords?.length) {
-    const ors = [];
-    for (const k of keywords) {
-      const like = `%${k}%`;
-      ors.push(`content.ilike.${like}`, `body.ilike.${like}`, `place.ilike.${like}`);
-    }
-    q = q.or(ors.join(','));
-  }
-
-  const { data, error } = await q;
   if (error) throw error;
-  return { count: data.length, items: data };
+  return { status: "saved", id: data.id };
 }
 
-/* ──────────────────────────
-   Contacts (People & Relationships)
-   ────────────────────────── */
-async function upsertContact(args) {
-  const { full_name, preferred_name = null, relation = null, email = null, phone = null } = args;
+/**
+ * Handle tool call: create_goal
+ */
+async function handleCreateGoal(args) {
+  const { title, category = "overall", why = null, target_date = null } = args || {};
+  if (!title) throw new Error("create_goal requires title");
 
-  if (!full_name || typeof full_name !== 'string') {
-    throw new Error('full_name is required');
+  const { data, error } = await supabase
+    .from("goals")
+    .insert([{ title, category, why, target_date }])
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return { status: "goal_created", id: data.id };
+}
+
+/**
+ * Handle tool call: create_task
+ */
+async function handleCreateTask(args) {
+  const {
+    title,
+    category, // work | personal
+    goal_id = null,
+    next_action = null,
+    due = null,
+    impact = null,
+    energy_fit = null,
+    effort_hours = null,
+  } = args || {};
+
+  if (!title || !category) throw new Error("create_task requires title and category");
+
+  const row = {
+    title,
+    category,
+    goal_id,
+    next_action,
+    due,
+    impact,
+    energy_fit,
+    effort_hours,
+  };
+
+  const { data, error } = await supabase
+    .from("tasks")
+    .insert([row])
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return { status: "task_created", id: data.id };
+}
+
+/**
+ * Handle tool call: search_documents
+ */
+async function handleSearchDocuments(args) {
+  const { keywords = [], date_from = null, date_to = null, limit = 10 } = args || {};
+  const kw = (Array.isArray(keywords) ? keywords : []).filter(Boolean);
+
+  // very simple search: ilike on content/body, newest first
+  let query = supabase
+    .from("v_documents_search")
+    .select("id, content, happened_at, recorded_at, place")
+    .order("event_time", { ascending: false })
+    .limit(limit);
+
+  if (kw.length > 0) {
+    // build OR ilike across content/body
+    const ors = kw
+      .map((k) => `content.ilike.%${k}%,body.ilike.%${k}%`)
+      .join(",");
+    query = query.or(ors);
   }
 
-  // 1) Upsert contact by full_name (case-insensitive unique index recommended)
-  const { data: found, error: findErr } = await sb()
-    .from('contacts')
-    .select('id')
-    .eq('full_name', full_name)
+  if (date_from) query = query.gte("event_time", date_from);
+  if (date_to) query = query.lte("event_time", date_to);
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  return { status: "ok", results: data || [] };
+}
+
+/**
+ * Handle tool call: upsert_contact
+ * args: { full_name: string, preferred_name?: string, relation: 'spouse'|'partner'|'child'|'parent'|'sibling'|'friend'|'colleague'|'other' }
+ */
+async function handleUpsertContact(args) {
+  const { full_name, preferred_name = null, relation } = args || {};
+  if (!full_name || !relation) throw new Error("upsert_contact requires full_name and relation");
+
+  // 1) ensure contact exists
+  let { data: existing, error: findErr } = await supabase
+    .from("contacts")
+    .select("id")
+    .ilike("full_name", full_name)
+    .limit(1)
     .maybeSingle();
+
   if (findErr) throw findErr;
 
-  let contactId = found?.id;
+  let contactId = existing?.id;
+
   if (!contactId) {
-    const { data: created, error: createErr } = await sb()
-      .from('contacts')
-      .insert({ full_name, preferred_name, email, phone })
-      .select()
+    const { data: created, error: insErr } = await supabase
+      .from("contacts")
+      .insert([{ full_name, preferred_name }])
+      .select("id")
       .single();
-    if (createErr) throw createErr;
+    if (insErr) throw insErr;
     contactId = created.id;
-  } else {
-    // Update light fields if provided
-    const updates = {};
-    if (preferred_name !== null) updates.preferred_name = preferred_name;
-    if (email !== null) updates.email = email;
-    if (phone !== null) updates.phone = phone;
-    if (Object.keys(updates).length) {
-      const { error: updErr } = await sb().from('contacts').update(updates).eq('id', contactId);
-      if (updErr) throw updErr;
-    }
+  } else if (preferred_name) {
+    // update preferred_name if provided
+    const { error: updErr } = await supabase
+      .from("contacts")
+      .update({ preferred_name })
+      .eq("id", contactId);
+    if (updErr) throw updErr;
   }
 
-  // 2) Relation (optional)
-  if (relation) {
-    const { data: rel, error: relErr } = await sb()
-      .from('contacts_to_user')
-      .select('contact_id')
-      .eq('contact_id', contactId)
-      .maybeSingle();
-    if (relErr) throw relErr;
+  // 2) upsert relation
+  const { error: relErr } = await supabase
+    .from("contacts_to_user")
+    .upsert({ contact_id: contactId, relation })
+    .eq("contact_id", contactId);
+  if (relErr) throw relErr;
 
-    if (!rel) {
-      const { error: insRelErr } = await sb()
-        .from('contacts_to_user')
-        .insert({ contact_id: contactId, relation });
-      if (insRelErr) throw insRelErr;
-    } else {
-      const { error: updRelErr } = await sb()
-        .from('contacts_to_user')
-        .update({ relation })
-        .eq('contact_id', contactId);
-      if (updRelErr) throw updRelErr;
-    }
-  }
-
-  return { ok: true, id: contactId, full_name, relation: relation || null };
+  return { status: "contact_upserted", id: contactId };
 }
 
-async function addContactKeyDate(args) {
-  // Accept either a direct contact_id or a name to look up
-  let { contact_id, full_name, kind = 'other', label = null, the_date } = args;
+/**
+ * Handle tool call: add_contact_key_date
+ * args: { full_name: string, kind: 'birthday'|'anniversary'|'other', the_date: 'YYYY-MM-DD', label?: string }
+ */
+async function handleAddContactKeyDate(args) {
+  const { full_name, kind, the_date, label = null } = args || {};
+  if (!full_name || !kind || !the_date)
+    throw new Error("add_contact_key_date requires full_name, kind, the_date");
 
-  if (!contact_id) {
-    if (!full_name) throw new Error('Provide contact_id or full_name');
-    const { data: c, error: e } = await sb()
-      .from('contacts')
-      .select('id')
-      .eq('full_name', full_name)
-      .maybeSingle();
-    if (e) throw e;
-    if (!c?.id) throw new Error('Contact not found by full_name');
-    contact_id = c.id;
+  // find contact
+  let { data: contact, error: findErr } = await supabase
+    .from("contacts")
+    .select("id")
+    .ilike("full_name", full_name)
+    .limit(1)
+    .maybeSingle();
+
+  if (findErr) throw findErr;
+
+  let contactId = contact?.id;
+  if (!contactId) {
+    const { data: created, error: insErr } = await supabase
+      .from("contacts")
+      .insert([{ full_name }])
+      .select("id")
+      .single();
+    if (insErr) throw insErr;
+    contactId = created.id;
   }
-  if (!the_date) throw new Error('the_date (YYYY-MM-DD) is required');
 
-  const { data, error } = await sb()
-    .from('contact_key_dates')
-    .insert({ contact_id, kind, label, the_date })
-    .select()
+  const { data, error } = await supabase
+    .from("contact_key_dates")
+    .insert([{ contact_id: contactId, kind, the_date, label }])
+    .select("id")
     .single();
+
   if (error) throw error;
-  return { ok: true, id: data.id, contact_id: data.contact_id, kind: data.kind, the_date: data.the_date };
+  return { status: "key_date_saved", id: data.id };
 }
 
-/* ▶ NEW: search_contacts wired to v_contacts */
-async function searchContacts(args) {
-  const { name_contains = null, relation = null, limit = 10 } = args || {};
-  const max = Math.min(Math.max(limit || 10, 1), 50);
+// Map tool to handler
+const HANDLERS = {
+  save_document: handleSaveDocument,
+  create_goal: handleCreateGoal,
+  create_task: handleCreateTask,
+  search_documents: handleSearchDocuments,
+  upsert_contact: handleUpsertContact,
+  add_contact_key_date: handleAddContactKeyDate,
+};
 
-  let q = sb()
-    .from('v_contacts')
-    .select('id, full_name, preferred_name, relation, birthday')
-    .limit(max);
-
-  if (name_contains) q = q.ilike('full_name', `%${name_contains}%`);
-  if (relation) q = q.eq('relation', relation);
-
-  const { data, error } = await q;
-  if (error) throw error;
-  return { count: data.length, items: data };
-}
-
-/* ──────────────────────────
-   Tool dispatch
-   ────────────────────────── */
-async function callToolByName(name, args) {
-  switch (name) {
-    case 'save_document':        return await saveDocument(args);
-    case 'create_goal':          return await createGoal(args);
-    case 'create_task':          return await createTask(args);
-    case 'search_documents':     return await searchDocuments(args);
-    case 'upsert_contact':       return await upsertContact(args);
-    case 'add_contact_key_date': return await addContactKeyDate(args);
-    case 'search_contacts':      return await searchContacts(args); // ⬅️ NEW
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
-}
-
-/* ──────────────────────────
-   Chat entrypoint
-   ────────────────────────── */
 export async function POST(req) {
   try {
     const { message } = await req.json();
-    if (!message || typeof message !== 'string') {
-      return Response.json({ ok: false, reason: 'No message' }, { status: 400 });
-    }
+    if (!message || typeof message !== "string") return bad("Missing message");
 
-    const openai = oa();
-    const assistant_id = getAssistantId();
+    // 1) First call: let Assistant decide tool calls
+    let input = [{ role: "user", content: message }];
 
-    // Running input list we’ll append to as tools fire
-    let input = [{ role: 'user', content: message }];
+    let resp = await openai.responses.create({
+      assistant_id: OPENAI_ASSISTANT_ID,
+      input,
+    });
 
-    let finalResponse = null;
-    let safetyCounter = 0;
+    // 2) If there are tool calls, execute them and provide outputs back
+    const toolOutputs = [];
 
-    // Loop: let the model call tools; we execute; we send outputs back; repeat
-    while (true) {
-      if (++safetyCounter > 6) throw new Error('Too many tool-call turns');
+    for (const item of resp.output || []) {
+      if (item.type !== "function_call") continue;
 
-      let resp = await openai.responses.create({
-        assistant_id,
-        input,
-      });
-
-      // Keep entire output (needed by API when reasoning items are present)
-      input = input.concat(resp.output);
-
-      // Collect tool calls
-      const toolCalls = resp.output.filter((x) => x.type === 'function_call');
-
-      if (toolCalls.length === 0) {
-        finalResponse = resp;
-        break;
+      const { name, arguments: argStr, call_id } = item;
+      const handler = HANDLERS[name];
+      if (!handler) {
+        // return a minimal output so the model can apologise
+        toolOutputs.push({
+          type: "function_call_output",
+          call_id,
+          output: JSON.stringify({ error: `Unknown tool: ${name}` }),
+        });
+        continue;
       }
 
-      // Execute each call, push function_call_output items
-      for (const tc of toolCalls) {
-        const name = tc.name;
-        const call_id = tc.call_id;
-        let args = {};
-        try { args = JSON.parse(tc.arguments || '{}'); } catch { args = {}; }
+      let args = {};
+      try {
+        args = argStr ? JSON.parse(argStr) : {};
+      } catch (e) {
+        toolOutputs.push({
+          type: "function_call_output",
+          call_id,
+          output: JSON.stringify({ error: "Invalid arguments JSON" }),
+        });
+        continue;
+      }
 
-        let result;
-        try {
-          result = await callToolByName(name, args);
-        } catch (e) {
-          result = { ok: false, error: String(e.message || e) };
-        }
-
-        input.push({
-          type: 'function_call_output',
+      try {
+        const result = await handler(args);
+        toolOutputs.push({
+          type: "function_call_output",
           call_id,
           output: JSON.stringify(result),
+        });
+      } catch (e) {
+        toolOutputs.push({
+          type: "function_call_output",
+          call_id,
+          output: JSON.stringify({ error: e.message || String(e) }),
         });
       }
     }
 
-    const text = finalResponse?.output_text || 'OK';
-    return Response.json({ ok: true, reply: text });
+    // 3) If we produced any tool outputs, send a SECOND request so the model can craft a final reply
+    let finalText = resp.output_text || "OK.";
 
-  } catch (e) {
-    console.error('assistant route error:', e);
-    return Response.json({ ok: false, reason: e.message || 'Unknown error' }, { status: 500 });
+    if (toolOutputs.length > 0) {
+      const followupInput = input
+        .concat(resp.output) // include the model's function_call items
+        .concat(toolOutputs); // include our tool outputs
+
+      const resp2 = await openai.responses.create({
+        assistant_id: OPENAI_ASSISTANT_ID,
+        input: followupInput,
+      });
+
+      finalText = resp2.output_text || finalText;
+    }
+
+    return ok({ text: finalText });
+  } catch (err) {
+    console.error("assistant route error:", err);
+    return new Response(JSON.stringify({ ok: false, error: err.message || String(err) }), {
+      status: 500,
+    });
   }
 }
