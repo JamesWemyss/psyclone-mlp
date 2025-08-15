@@ -54,7 +54,7 @@ export default function Home() {
       </form>
 
       <p style={{ marginTop: 10, color: '#666', fontSize: 12 }}>
-        Try: “I had a walk with mum yesterday in Tatton at noon”, “Add a life goal: Build a personal brand by 2026”, “Add a work priority…”.
+        Try: “I had a walk with mum yesterday in Tatton at noon”, “Add a life goal: Build a personal brand by 2026”.
       </p>
     </main>
   );
