@@ -1,3 +1,6 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = { reactStrictMode: true };
-module.exports = nextConfig; // CommonJS so Vercel detects Next.js
+const nextConfig = {
+  reactStrictMode: true,
+};
+
+export default nextConfig;
