@@ -10,24 +10,27 @@ function oa() { return new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); }
  * Supported actions:
  *  - create_goal { title, category, why, target_date }
  *  - create_task { title, category, goal_title?, due?, impact?, energy_fit?, effort_hours?, next_action? }
- *  - complete_task { title? }            // resolves by fuzzy title
- *  - reorder_task_top { title? }         // move to top by fuzzy title
+ *  - complete_task { title? }
+ *  - reorder_task_top { title? }
+ *  - save_document { kind, content, happened_at?, place?, person_names?[] }
  *  - show_lists {}
- *  - chat {}                             // normal assistant reply
+ *  - chat {}
  */
 const ROUTER = `You are Psyclone's command router for James (UK English).
-Return STRICT JSON with shape:
+Return STRICT JSON:
 {
-  "action": "create_goal|create_task|complete_task|reorder_task_top|show_lists|chat",
+  "action": "create_goal|create_task|complete_task|reorder_task_top|save_document|show_lists|chat",
   "goal": { "title": "", "category": "overall|personal|work", "why": "", "target_date": "" } | null,
-  "task": { "title": "", "category": "personal|work", "goal_title": "", "due": "", "impact": 1, "energy_fit": 1, "effort_hours": 0, "next_action": "" } | null
+  "task": { "title": "", "category": "personal|work", "goal_title": "", "due": "", "impact": 1, "energy_fit": 1, "effort_hours": 0, "next_action": "" } | null,
+  "doc":  { "kind": "event|note|fact", "content": "", "happened_at": "", "place": "", "person_names": [] } | null
 }
-Rules:
-- If user asks to add/rename/link/complete/snooze/reorder a priority, choose create_task/complete_task/reorder_task_top.
-- If they add a life goal, choose create_goal.
-- If they say "show", "list", "what are my priorities", choose show_lists.
-- Else, choose chat.
-- Use ISO 8601 for dates when possible. Omit fields you don't know (use empty string or null).`;
+Decide:
+- If user adds a life goal, use action create_goal. Prefer category "overall" when they say "life goal".
+- If user adds/edits/finishes/reorders a priority, choose the relevant task action.
+- If the message describes something that happened (met, walked, had dinner, went, saw, “yesterday/today/last week”), choose action save_document as kind "event" and extract happened_at (ISO if possible), place, and person_names.
+- If they ask to show or list priorities, choose show_lists.
+- Otherwise choose chat.
+Use ISO 8601 dates where possible; omit unknowns with empty strings.`;
 
 async function fuzzyFindTaskByTitle(client, title) {
   const like = `%${title}%`;
@@ -61,7 +64,7 @@ export async function POST(req) {
     const openai = oa();
 
     // Route to a command
-    const r = await openai.chat.completions.create({
+    const routed = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.2,
       response_format: { type: 'json_object' },
@@ -69,36 +72,53 @@ export async function POST(req) {
     });
 
     let cmd = {};
-    try { cmd = JSON.parse(r.choices?.[0]?.message?.content || '{}'); } catch {}
+    try { cmd = JSON.parse(routed.choices?.[0]?.message?.content || '{}'); } catch {}
 
-    const action = cmd.action || 'chat';
+    // ===== GOALS =====
+    if (cmd.action === 'create_goal' && cmd.goal?.title) {
+      // Heuristic: if user said “life goal”, force overall
+      const lower = message.toLowerCase();
+      let category = cmd.goal.category || 'overall';
+      if (lower.includes('life goal')) category = 'overall';
 
-    // Handle actions
-    if (action === 'create_goal' && cmd.goal?.title) {
-      const { title, category = 'overall', why = '', target_date = null } = cmd.goal;
-      const { data, error } = await client.from('goals').insert({ title, category, why, target_date }).select().single();
+      const { data, error } = await client
+        .from('goals')
+        .insert({
+          title: cmd.goal.title,
+          category,
+          why: cmd.goal.why || '',
+          target_date: cmd.goal.target_date || null
+        })
+        .select()
+        .single();
       if (error) throw error;
       return Response.json({ ok: true, reply: `Added goal: “${data.title}”.`, refresh: true });
     }
 
-    if (action === 'create_task' && cmd.task?.title && cmd.task?.category) {
+    // ===== TASKS =====
+    if (cmd.action === 'create_task' && cmd.task?.title && cmd.task?.category) {
       let { title, category, goal_title = '', due = null, impact = null, energy_fit = null, effort_hours = null, next_action = null } = cmd.task;
 
-      // If goal_title provided, resolve to goal_id
+      // Map “work/personal” only
+      if (!['work','personal'].includes(category)) category = 'work';
+
+      // Try to resolve a goal by title if provided
       let goal_id = null;
       if (goal_title) {
         const g = await findGoalByTitle(client, goal_title);
         goal_id = g?.id || null;
       }
 
-      const { data, error } = await client.from('tasks').insert({
-        title, category, goal_id, due, impact, energy_fit, effort_hours, next_action
-      }).select().single();
+      const { data, error } = await client
+        .from('tasks')
+        .insert({ title, category, goal_id, due: due || null, impact, energy_fit, effort_hours, next_action })
+        .select()
+        .single();
       if (error) throw error;
       return Response.json({ ok: true, reply: `Added ${category} priority: “${data.title}”.`, refresh: true });
     }
 
-    if (action === 'complete_task') {
+    if (cmd.action === 'complete_task') {
       const title = cmd?.task?.title || '';
       const task = await fuzzyFindTaskByTitle(client, title);
       if (!task) return Response.json({ ok: true, reply: `I couldn't find a task matching “${title}”.` });
@@ -107,7 +127,7 @@ export async function POST(req) {
       return Response.json({ ok: true, reply: `Marked done: “${task.title}”.`, refresh: true });
     }
 
-    if (action === 'reorder_task_top') {
+    if (cmd.action === 'reorder_task_top') {
       const title = cmd?.task?.title || '';
       const task = await fuzzyFindTaskByTitle(client, title);
       if (!task) return Response.json({ ok: true, reply: `I couldn't find a task matching “${title}”.` });
@@ -119,25 +139,39 @@ export async function POST(req) {
         .order('order_override', { ascending: true, nullsFirst: true })
         .limit(1);
       if (mErr) throw mErr;
-      let newVal = (mins && mins.length && mins[0].order_override !== null) ? (mins[0].order_override - 1) : -1;
+      const newVal = (mins && mins.length && mins[0].order_override !== null) ? mins[0].order_override - 1 : -1;
       const { error: uErr } = await client.from('tasks').update({ order_override: newVal }).eq('id', task.id);
       if (uErr) throw uErr;
       return Response.json({ ok: true, reply: `Moved to #1 in ${task.category}: “${task.title}”.`, refresh: true });
     }
 
-    if (action === 'show_lists') {
-      // Just a friendly reply; the UI will already show lists
+    // ===== DOCUMENTS (stories / events / notes) =====
+    if (cmd.action === 'save_document' && cmd.doc?.content) {
+      const insert = {
+        kind: (cmd.doc.kind === 'note' || cmd.doc.kind === 'fact') ? cmd.doc.kind : 'event',
+        content: cmd.doc.content.slice(0, 500),
+        happened_at: cmd.doc.happened_at || null,
+        place: cmd.doc.place || null,
+        person_names: Array.isArray(cmd.doc.person_names) ? cmd.doc.person_names : [],
+        source: 'web',
+      };
+      const { error } = await client.from('documents').insert(insert);
+      if (error) throw error;
+      return Response.json({ ok: true, reply: `Saved: “${insert.content}”.` });
+    }
+
+    if (cmd.action === 'show_lists') {
       return Response.json({ ok: true, reply: "Here are your current priorities and goals." });
     }
 
-    // Default: conversational answer (with tiny memory from active tasks)
+    // ===== Default conversational reply with a tiny context =====
     const { data: mem } = await client
       .from('v_tasks_active')
       .select('title, category, next_action, due, score')
       .order('score', { ascending: false })
       .limit(6);
 
-    const context = (mem || []).map((t, i) =>
+    const context = (mem || []).map((t) =>
       `• [${t.category}] ${t.title}${t.next_action ? ` — next: ${t.next_action}` : ''}${t.due ? ` — due: ${t.due}` : ''} (score ${t.score})`
     ).join('\n');
 
