@@ -1,9 +1,12 @@
+// app/api/assistant/route.js
 export const runtime = 'nodejs';
 
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 
-// ───── helpers ───────────────────────────────────────────────
+/* ──────────────────────────
+   Clients
+   ────────────────────────── */
 function sb() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -15,75 +18,86 @@ function oa() {
   if (!key) throw new Error('Missing OPENAI_API_KEY');
   return new OpenAI({ apiKey: key });
 }
-const ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
+function getAssistantId() {
+  const id = process.env.OPENAI_ASSISTANT_ID;
+  if (!id) throw new Error('Missing OPENAI_ASSISTANT_ID');
+  return id;
+}
 
-// ───── tool executors ────────────────────────────────────────
+/* ──────────────────────────
+   DB actions (docs/goals/tasks)
+   ────────────────────────── */
 async function saveDocument(args) {
-  const s = sb();
-  const insert = {
+  const payload = {
     kind: args.kind || 'note',
-    content: args.content?.slice(0, 180) || 'Untitled',
+    content: args.content || '',
     body: args.body || null,
     happened_at: args.happened_at || null,
     place: args.place || null,
     person_names: Array.isArray(args.person_names) ? args.person_names : [],
-    category: args.category || null,
     amount: args.amount ?? null,
-    is_ignored: false,
-    recorded_at: new Date().toISOString(),
-    source: 'assistant'
+    category: args.category || 'other',
+    source: 'assistant',
   };
-  const { error } = await s.from('documents').insert(insert);
+  const { data, error } = await sb().from('documents').insert(payload).select().single();
   if (error) throw error;
-  return 'ok';
+  return { ok: true, id: data.id, summary: data.content };
 }
 
 async function createGoal(args) {
-  const s = sb();
-  const row = {
+  const payload = {
     title: args.title,
-    category: args.category || 'overall',
+    category: args.category || 'overall', // overall | work | personal
     why: args.why || null,
-    target_date: args.target_date || null
+    target_date: args.target_date || null,
   };
-  const { error } = await s.from('goals').insert(row);
+  const { data, error } = await sb().from('goals').insert(payload).select().single();
   if (error) throw error;
-  return 'ok';
+  return { ok: true, id: data.id, title: data.title };
 }
 
 async function createTask(args) {
-  const s = sb();
-  const row = {
+  const payload = {
     title: args.title,
-    category: args.category, // work|personal required by tool schema
+    category: args.category, // work | personal (required)
     goal_id: args.goal_id || null,
     next_action: args.next_action || null,
     due: args.due || null,
     impact: args.impact ?? null,
     energy_fit: args.energy_fit ?? null,
-    effort_hours: args.effort_hours ?? null
+    effort_hours: args.effort_hours ?? null,
   };
-  const { error } = await s.from('tasks').insert(row);
+  const { data, error } = await sb().from('tasks').insert(payload).select().single();
   if (error) throw error;
-  return 'ok';
+  return { ok: true, id: data.id, title: data.title };
 }
 
 async function searchDocuments(args) {
-  const s = sb();
-  let q = s
+  const {
+    keywords = [],
+    person_names = [],
+    kind = '',
+    date_from = '',
+    date_to = '',
+    limit = 10,
+  } = args || {};
+
+  const supabase = sb();
+  let q = supabase
     .from('v_documents_search')
-    .select('id, kind, content, place, happened_at, recorded_at')
-    .order('happened_at', { ascending: false })
-    .limit(Math.min(Math.max(args.limit || 10, 1), 20));
+    .select('id, kind, content, place, event_time, recorded_at, category, person_names')
+    .eq('is_ignored', false)
+    .order('event_time', { ascending: false })
+    .limit(Math.min(Math.max(limit || 10, 1), 50));
 
-  if (args.date_from) q = q.gte('happened_at', args.date_from);
-  if (args.date_to) q = q.lte('happened_at', args.date_to);
+  if (kind) q = q.eq('kind', kind);
+  if (date_from) q = q.gte('event_time', date_from);
+  if (date_to) q = q.lte('event_time', date_to);
+  if (person_names?.length) q = q.contains('person_names', person_names);
 
-  // keyword ORs across content/body/place
-  const kws = Array.isArray(args.keywords) ? args.keywords : [];
-  if (kws.length) {
+  if (keywords?.length) {
     const ors = [];
-    for (const k of kws) {
+    for (const k of keywords) {
       const like = `%${k}%`;
       ors.push(`content.ilike.${like}`, `body.ilike.${like}`, `place.ilike.${like}`);
     }
@@ -92,166 +106,201 @@ async function searchDocuments(args) {
 
   const { data, error } = await q;
   if (error) throw error;
-
-  // Short markdown summary for the chat
-  const items = (data || []).map(d => {
-    const when = d.happened_at || d.recorded_at;
-    const place = d.place ? ` — **Place:** ${d.place}` : '';
-    return `- **${d.content}**\n  **When:** ${when}${place}`;
-  });
-  return items.length ? items.join('\n') : 'No matches.';
+  return { count: data.length, items: data };
 }
 
-// NEW: create/update a contact (and relation)
+/* ──────────────────────────
+   Contacts (People & Relationships)
+   ────────────────────────── */
 async function upsertContact(args) {
-  const s = sb();
-  const full_name = (args.full_name || '').trim();
-  if (!full_name) throw new Error('full_name required');
+  const { full_name, preferred_name = null, relation = null, email = null, phone = null } = args;
 
-  // find by lower(full_name)
-  const { data: found, error: findErr } = await s
+  if (!full_name || typeof full_name !== 'string') {
+    throw new Error('full_name is required');
+  }
+
+  // 1) Upsert contact by full_name (case-insensitive unique index recommended)
+  const { data: found, error: findErr } = await sb()
     .from('contacts')
     .select('id')
     .eq('full_name', full_name)
     .maybeSingle();
   if (findErr) throw findErr;
 
-  if (found?.id) {
-    // update
-    const { error: updErr } = await s.from('contacts').update({
-      preferred_name: args.preferred_name ?? null,
-      email: args.email ?? null,
-      phone: args.phone ?? null,
-      notes: args.notes ?? null
-    }).eq('id', found.id);
-    if (updErr) throw updErr;
-
-    if (args.relation) {
-      // upsert relation
-      const { error: relErr } = await s
-        .from('contacts_to_user')
-        .upsert({ contact_id: found.id, relation: args.relation }, { onConflict: 'contact_id' });
-      if (relErr) throw relErr;
-    }
+  let contactId = found?.id;
+  if (!contactId) {
+    const { data: created, error: createErr } = await sb()
+      .from('contacts')
+      .insert({ full_name, preferred_name, email, phone })
+      .select()
+      .single();
+    if (createErr) throw createErr;
+    contactId = created.id;
   } else {
-    // insert then relation
-    const { data: ins, error: insErr } = await s
-      .from('contacts')
-      .insert({
-        full_name,
-        preferred_name: args.preferred_name ?? null,
-        email: args.email ?? null,
-        phone: args.phone ?? null,
-        notes: args.notes ?? null
-      })
-      .select('id')
-      .single();
-    if (insErr) throw insErr;
-
-    if (args.relation) {
-      const { error: relErr } = await s
-        .from('contacts_to_user')
-        .upsert({ contact_id: ins.id, relation: args.relation }, { onConflict: 'contact_id' });
-      if (relErr) throw relErr;
+    // Update light fields if provided
+    const updates = {};
+    if (preferred_name !== null) updates.preferred_name = preferred_name;
+    if (email !== null) updates.email = email;
+    if (phone !== null) updates.phone = phone;
+    if (Object.keys(updates).length) {
+      const { error: updErr } = await sb().from('contacts').update(updates).eq('id', contactId);
+      if (updErr) throw updErr;
     }
   }
-  return `ok`;
+
+  // 2) Relation (optional)
+  if (relation) {
+    const { data: rel, error: relErr } = await sb()
+      .from('contacts_to_user')
+      .select('contact_id')
+      .eq('contact_id', contactId)
+      .maybeSingle();
+    if (relErr) throw relErr;
+
+    if (!rel) {
+      const { error: insRelErr } = await sb()
+        .from('contacts_to_user')
+        .insert({ contact_id: contactId, relation });
+      if (insRelErr) throw insRelErr;
+    } else {
+      const { error: updRelErr } = await sb()
+        .from('contacts_to_user')
+        .update({ relation })
+        .eq('contact_id', contactId);
+      if (updRelErr) throw updRelErr;
+    }
+  }
+
+  return { ok: true, id: contactId, full_name, relation: relation || null };
 }
 
-// NEW: add a key date (e.g., birthday) for a contact
 async function addContactKeyDate(args) {
-  const s = sb();
-  const full_name = (args.full_name || '').trim();
-  if (!full_name) throw new Error('full_name required');
+  // Accept either a direct contact_id or a name to look up
+  let { contact_id, full_name, kind = 'other', label = null, the_date } = args;
 
-  // ensure contact exists
-  let { data: contact, error: findErr } = await s
-    .from('contacts')
-    .select('id')
-    .eq('full_name', full_name)
-    .maybeSingle();
-  if (findErr) throw findErr;
-
-  if (!contact?.id) {
-    const { data: ins, error: insErr } = await s
+  if (!contact_id) {
+    if (!full_name) throw new Error('Provide contact_id or full_name');
+    const { data: c, error: e } = await sb()
       .from('contacts')
-      .insert({ full_name })
       .select('id')
-      .single();
-    if (insErr) throw insErr;
-    contact = ins;
+      .eq('full_name', full_name)
+      .maybeSingle();
+    if (e) throw e;
+    if (!c?.id) throw new Error('Contact not found by full_name');
+    contact_id = c.id;
   }
+  if (!the_date) throw new Error('the_date (YYYY-MM-DD) is required');
 
-  const row = {
-    contact_id: contact.id,
-    kind: args.kind,          // 'birthday' | 'anniversary' | 'other'
-    the_date: args.the_date,  // YYYY-MM-DD
-    label: args.label ?? null
-  };
-  const { error } = await s.from('contact_key_dates').insert(row);
+  const { data, error } = await sb()
+    .from('contact_key_dates')
+    .insert({ contact_id, kind, label, the_date })
+    .select()
+    .single();
   if (error) throw error;
-  return 'ok';
+  return { ok: true, id: data.id, contact_id: data.contact_id, kind: data.kind, the_date: data.the_date };
 }
 
-// Route tool → executor
-async function executeToolCall(name, args) {
+/* ▶ NEW: search_contacts wired to v_contacts */
+async function searchContacts(args) {
+  const { name_contains = null, relation = null, limit = 10 } = args || {};
+  const max = Math.min(Math.max(limit || 10, 1), 50);
+
+  let q = sb()
+    .from('v_contacts')
+    .select('id, full_name, preferred_name, relation, birthday')
+    .limit(max);
+
+  if (name_contains) q = q.ilike('full_name', `%${name_contains}%`);
+  if (relation) q = q.eq('relation', relation);
+
+  const { data, error } = await q;
+  if (error) throw error;
+  return { count: data.length, items: data };
+}
+
+/* ──────────────────────────
+   Tool dispatch
+   ────────────────────────── */
+async function callToolByName(name, args) {
   switch (name) {
-    case 'save_document':          return await saveDocument(args);
-    case 'create_goal':            return await createGoal(args);
-    case 'create_task':            return await createTask(args);
-    case 'search_documents':       return await searchDocuments(args);
-    case 'upsert_contact':         return await upsertContact(args);
-    case 'add_contact_key_date':   return await addContactKeyDate(args);
+    case 'save_document':        return await saveDocument(args);
+    case 'create_goal':          return await createGoal(args);
+    case 'create_task':          return await createTask(args);
+    case 'search_documents':     return await searchDocuments(args);
+    case 'upsert_contact':       return await upsertContact(args);
+    case 'add_contact_key_date': return await addContactKeyDate(args);
+    case 'search_contacts':      return await searchContacts(args); // ⬅️ NEW
     default:
-      return `unsupported tool: ${name}`;
+      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-// ───── main POST handler (Assistants v2 run loop) ────────────
+/* ──────────────────────────
+   Chat entrypoint
+   ────────────────────────── */
 export async function POST(req) {
   try {
     const { message } = await req.json();
-    if (!message) return Response.json({ ok: false, reason: 'No message' }, { status: 400 });
+    if (!message || typeof message !== 'string') {
+      return Response.json({ ok: false, reason: 'No message' }, { status: 400 });
+    }
 
     const openai = oa();
-    // 1) create thread
-    const thread = await openai.beta.threads.create();
-    await openai.beta.threads.messages.create(thread.id, { role: 'user', content: message });
+    const assistant_id = getAssistantId();
 
-    // 2) run with our Assistant
-    let run = await openai.beta.threads.runs.create(thread.id, { assistant_id: ASSISTANT_ID });
+    // Running input list we’ll append to as tools fire
+    let input = [{ role: 'user', content: message }];
 
-    // 3) loop: handle tool calls until complete
-    for (;;) {
-      run = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+    let finalResponse = null;
+    let safetyCounter = 0;
 
-      if (run.status === 'requires_action') {
-        const toolOutputs = [];
-        for (const tc of run.required_action.submit_tool_outputs.tool_calls) {
-          const name = tc.function.name;
-          const args = JSON.parse(tc.function.arguments || '{}');
-          const result = await executeToolCall(name, args).catch(e => `error: ${e.message}`);
-          toolOutputs.push({ tool_call_id: tc.id, output: String(result) });
+    // Loop: let the model call tools; we execute; we send outputs back; repeat
+    while (true) {
+      if (++safetyCounter > 6) throw new Error('Too many tool-call turns');
+
+      let resp = await openai.responses.create({
+        assistant_id,
+        input,
+      });
+
+      // Keep entire output (needed by API when reasoning items are present)
+      input = input.concat(resp.output);
+
+      // Collect tool calls
+      const toolCalls = resp.output.filter((x) => x.type === 'function_call');
+
+      if (toolCalls.length === 0) {
+        finalResponse = resp;
+        break;
+      }
+
+      // Execute each call, push function_call_output items
+      for (const tc of toolCalls) {
+        const name = tc.name;
+        const call_id = tc.call_id;
+        let args = {};
+        try { args = JSON.parse(tc.arguments || '{}'); } catch { args = {}; }
+
+        let result;
+        try {
+          result = await callToolByName(name, args);
+        } catch (e) {
+          result = { ok: false, error: String(e.message || e) };
         }
-        await openai.beta.threads.runs.submitToolOutputs(thread.id, run.id, { tool_outputs: toolOutputs });
-        continue;
-      }
 
-      if (['completed', 'failed', 'cancelled', 'expired'].includes(run.status)) break;
-      await new Promise(r => setTimeout(r, 600)); // small poll
-    }
-
-    // 4) collect latest assistant message(s)
-    const msgs = await openai.beta.threads.messages.list(thread.id, { limit: 5 });
-    const texts = [];
-    for (const m of msgs.data) {
-      if (m.role === 'assistant') {
-        const chunk = m.content?.map(c => c.text?.value).filter(Boolean).join('\n').trim();
-        if (chunk) texts.push(chunk);
+        input.push({
+          type: 'function_call_output',
+          call_id,
+          output: JSON.stringify(result),
+        });
       }
     }
-    return Response.json({ ok: true, reply: texts.reverse().join('\n\n') || 'OK' });
+
+    const text = finalResponse?.output_text || 'OK';
+    return Response.json({ ok: true, reply: text });
+
   } catch (e) {
+    console.error('assistant route error:', e);
     return Response.json({ ok: false, reason: e.message || 'Unknown error' }, { status: 500 });
   }
 }
